@@ -22,8 +22,30 @@ type ExampleReply struct {
 	Y int
 }
 
-// Add your RPC definitions here.
+type MapRequest struct{}
 
+type MapResponse struct {
+	Task      MapTask
+	NReduce   int
+	Exception int
+}
+
+const (
+	MAP_EXCEPTION_ALL_TASK_ASSIGNED   = 1
+	MAP_EXCEPTION_ALL_TASK_COMPELETED = 2
+)
+
+type MapDoneRequest struct {
+	TaskId int
+}
+
+type MapDoneResponse struct{}
+
+type ReduceRequest struct{}
+
+type ReduceResponse struct{}
+
+// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
