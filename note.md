@@ -133,4 +133,15 @@ $ bash test-mr.sh
 
 
 
-- reduce phase开始时
+- reduce phase
+  - reduce phase任务的数量实际是由外部输入的nReduce来提供的
+  - coordinator使用数据结构来管理reduce task任务状态. 因为要fault tolerance.重试机制.
+    - 类似于map任务, 每个reduce任务都有3个状态
+      - -1: 未分配
+      - 0: 被分配
+      - 1: 已完成
+  - 一个worker拿到reduce任务后, 根据任务编号, 基于我们的文件格式, 可以找到所有的中间文件.
+    - 从所有文件中拿到多个kv pair. 
+    - 因为pair是从多个文件中拿到的, 所以要做排序.
+    - 然后对kv pair应用reduce函数. 拿到这个reduce task的结果.
+  - 存疑: nReduce个结果最后还要经过最后一次reduce. 这个final reduce也要由一个worker完成.

@@ -31,19 +31,30 @@ type MapResponse struct {
 }
 
 const (
-	MAP_EXCEPTION_ALL_TASK_ASSIGNED   = 1
-	MAP_EXCEPTION_ALL_TASK_COMPELETED = 2
+	EXCEPTION_ALL_TASK_ASSIGNED   = 1
+	EXCEPTION_ALL_TASK_COMPELETED = 2
 )
 
 type MapDoneRequest struct {
-	TaskId int
+	TaskId   int
+	AssignId int
 }
 
 type MapDoneResponse struct{}
 
 type ReduceRequest struct{}
 
-type ReduceResponse struct{}
+type ReduceResponse struct {
+	Task      ReduceTask
+	Exception int
+}
+
+type ReduceDoneRequest struct {
+	TaskId   int
+	AssignId int
+}
+
+type ReduceDoneResponse struct{}
 
 // Add your RPC definitions here.
 

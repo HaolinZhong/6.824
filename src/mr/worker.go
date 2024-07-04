@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
+	"sort"
 	"time"
 )
 import "log"
@@ -17,6 +19,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // Task number for each KeyValue emitted by Map.
@@ -31,6 +40,19 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	//fmt.Println("worker started")
+
+	MapPhase(mapf)
+
+	//fmt.Println("enter reduce")
+
+	ReducePhase(reducef)
+
+	//fmt.Println("worker gracefully exit")
+
+}
+
+func MapPhase(mapf func(string, string) []KeyValue) {
 	for {
 		args := MapRequest{}
 		response := MapResponse{}
@@ -40,6 +62,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 			filename := response.Task.Filename
 			taskId := response.Task.TaskId
+			assignId := response.Task.AssignId
 			nReduce := response.NReduce
 
 			file, err := os.Open(filename)
@@ -58,26 +81,99 @@ func Worker(mapf func(string, string) []KeyValue,
 				fmt.Println(err)
 				continue
 			}
-			fmt.Printf("map done for task %d, file %s\n", taskId, filename)
-			call("Coordinator.DoneMap", &MapDoneRequest{TaskId: taskId}, &MapDoneResponse{})
+			//fmt.Printf("map done for task %d, file %s\n", taskId, filename)
+			call("Coordinator.DoneMap", &MapDoneRequest{TaskId: taskId, AssignId: assignId}, &MapDoneResponse{})
 
-		} else if response.Exception == MAP_EXCEPTION_ALL_TASK_ASSIGNED {
-			fmt.Printf("worker: all task were assigned %s\n", time.Now())
+		} else if response.Exception == EXCEPTION_ALL_TASK_ASSIGNED {
+			//fmt.Printf("worker: all map task were assigned %s\n", time.Now())
 			time.Sleep(time.Second)
 
-		} else if response.Exception == MAP_EXCEPTION_ALL_TASK_COMPELETED {
-			fmt.Printf("worker: all task were completed\n")
+		} else if response.Exception == EXCEPTION_ALL_TASK_COMPELETED {
+			//fmt.Printf("worker: all map task were completed\n")
 			break
 		}
 	}
+}
 
-	//call("Coordinator.StartReduce", &ReduceRequest{}, &ReduceResponse{})
-	fmt.Println("enter reduce")
+func ReducePhase(reducef func(string, []string) string) {
+	for {
+		args := ReduceRequest{}
+		response := ReduceResponse{}
+		call("Coordinator.StartReduce", &args, &response)
 
+		if response.Exception == 0 {
+
+			taskId := response.Task.TaskId
+			assignId := response.Task.AssignId
+			pattern := fmt.Sprintf("mr-*-%d.json", taskId)
+			intermediate := []KeyValue{}
+
+			files, err := filepath.Glob(pattern)
+			if err != nil {
+				fmt.Printf("worker: failed to find files with pattern %s\n", pattern)
+				continue
+			}
+			for _, filename := range files {
+				kva, err := readKVpairFromFile(filename)
+				//fmt.Print(kva)
+				if err != nil {
+					fmt.Printf("worker: failed to read KV from file %s\n", filename)
+					continue
+				}
+				intermediate = append(intermediate, kva...)
+			}
+
+			sort.Sort(ByKey(intermediate))
+			//fmt.Println(intermediate)
+
+			toname := fmt.Sprintf("tmp-out-%d.out", taskId)
+			oname := fmt.Sprintf("mr-out-%d.out", taskId)
+			tmpFile, err := ioutil.TempFile("", toname)
+
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				// 通过j来拿到slice里某个key所占据的范围
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				// 将专属于这个key的东西拿到values里面
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				// 把key和values给到reducer func, 执行并得到结果
+				output := reducef(intermediate[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(tmpFile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
+			}
+
+			tmpFile.Close()
+			if err := os.Rename(tmpFile.Name(), oname); err != nil {
+				fmt.Print(err)
+				continue
+			}
+
+			//fmt.Printf("reduce done for task %d\n", taskId)
+			call("Coordinator.DoneReduce", &ReduceDoneRequest{TaskId: taskId, AssignId: assignId}, &ReduceDoneResponse{})
+
+		} else if response.Exception == EXCEPTION_ALL_TASK_ASSIGNED {
+			//fmt.Printf("worker: all reduce task were assigned %s\n", time.Now())
+			time.Sleep(1 * time.Second)
+
+		} else if response.Exception == EXCEPTION_ALL_TASK_COMPELETED {
+			//fmt.Printf("worker: all reduce task were completed\n")
+			break
+		}
+	}
 }
 
 func writeKVpairToFile(kva []KeyValue, taskId, nReduce int) error {
 	idxToFileMap := make(map[int]*os.File)
+	idxToKvaMap := make(map[int][]KeyValue)
 
 	for i := 0; i < nReduce; i++ {
 		tmpFile, err := ioutil.TempFile("", fmt.Sprintf("temp-%d-%d.json", taskId, i))
@@ -86,34 +182,52 @@ func writeKVpairToFile(kva []KeyValue, taskId, nReduce int) error {
 		}
 		defer tmpFile.Close()
 		idxToFileMap[i] = tmpFile
+		idxToKvaMap[i] = make([]KeyValue, 0)
 	}
 
 	for _, kv := range kva {
-		jsonData, err := json.Marshal(kv)
-		if err != nil {
-			return errors.New("failed to encode json data")
-		}
-
-		file := idxToFileMap[ihash(kv.Key)%nReduce]
-
-		if _, err := file.Write(jsonData); err != nil {
-			fmt.Println(err)
-			fmt.Printf("failed to write into file %s", file.Name())
-			return errors.New("failed to write json data to file")
-		}
+		idx := ihash(kv.Key) % nReduce
+		kva := idxToKvaMap[idx]
+		kva = append(kva, kv)
+		idxToKvaMap[idx] = kva
 	}
 
 	for i := 0; i < nReduce; i++ {
 		tmpFile := idxToFileMap[i]
-		tmpFileName := tmpFile.Name()
+		kva := idxToKvaMap[i]
+		jsonData, err := json.Marshal(kva)
+		if err != nil {
+			return errors.New("failed to encode json data")
+		}
+
+		if _, err := tmpFile.Write(jsonData); err != nil {
+			fmt.Println(err)
+			fmt.Printf("failed to write into file %s", tmpFile.Name())
+			return errors.New("failed to write json data to file")
+		}
+
 		tmpFile.Close()
 
-		if err := os.Rename(tmpFileName, fmt.Sprintf("mr-%d-%d.json", taskId, i)); err != nil {
+		if err := os.Rename(tmpFile.Name(), fmt.Sprintf("mr-%d-%d.json", taskId, i)); err != nil {
 			return errors.New("failed to rename temp file")
 		}
 	}
 
 	return nil
+}
+
+func readKVpairFromFile(filename string) (kva []KeyValue, err error) {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	err = json.Unmarshal(content, &kva)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Printf("failed to unmarshal from file %s\n", filename)
+		return kva, err
+	}
+	return kva, nil
 }
 
 // example function to show how to make an RPC call to the coordinator.
