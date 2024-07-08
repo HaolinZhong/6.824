@@ -77,17 +77,22 @@ type Raft struct {
 
 	// 从这里开始, 不需要mu保护
 	heartBeat *HeartBeat
-
-	id int // debug use only
 }
 
 const (
-	heartBeatInterval = 150 * time.Millisecond
+	HEARTBEAT_INTERVAL     = 150 * time.Millisecond
+	TIMEOUT_MULT_FACTOR_LB = 2
+	TIMEOUT_MULT_FACTOR_UB = 6
 
 	IDENTITY_FOLLOWER int32 = iota
 	IDENTITY_CANDIDATE
 	IDENTITY_LEADER
 )
+
+func getRandomizedTimeout() time.Duration {
+	timeout := (TIMEOUT_MULT_FACTOR_LB + rand.Float64()*(TIMEOUT_MULT_FACTOR_UB-TIMEOUT_MULT_FACTOR_LB)) * float64(HEARTBEAT_INTERVAL)
+	return time.Duration(timeout)
+}
 
 // 用来承接从persister中拿出的数据
 type PersistedState struct {
@@ -148,13 +153,21 @@ func (h *HeartBeat) receive() {
 	h.received = true
 }
 
+func (rf *Raft) GetIdentity() int32 {
+	return atomic.LoadInt32(&rf.identity)
+}
+
+func (rf *Raft) SetIdentity(newIdentity int32) {
+	atomic.StoreInt32(&rf.identity, newIdentity)
+}
+
 // return CurrentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persistedState.CurrentTerm, IDENTITY_LEADER == atomic.LoadInt32(&rf.identity)
+	return rf.persistedState.CurrentTerm, rf.GetIdentity() == IDENTITY_LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -171,7 +184,10 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.persistedState)
+	err := e.Encode(rf.persistedState)
+	if err != nil {
+		return
+	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -214,6 +230,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
+// Raft系统的一大规则: rpc的被调用者拿到请求后, 以及rpc的调用者收到回复后, 都要检查消息中的term.
+// 如果peer给出的term大于自身了, 就需要增大自身的term以及相关的属性, 且明确自身是follower.
+// 这个方法可以无脑放到rpc方法的最开始, 以及读取rpc reply的方法中
+func (rf *Raft) updateIfNewTerm(term int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if term > rf.persistedState.CurrentTerm {
+		rf.persistedState.CurrentTerm = term
+		rf.persistedState.VotedFor = -1
+		rf.leaderState = nil
+		rf.SetIdentity(IDENTITY_FOLLOWER)
+		rf.persist()
+		//log.Printf("rf %d updated to term %d\n", rf.me, term)
+	}
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -236,67 +268,43 @@ type RequestVoteReply struct {
 // 整个方法是上锁的, 因此多次requestVote会顺序执行.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	//identity := atomic.LoadInt32(&rf.identity)
-	//if IDENTITY_FOLLOWER == identity {
+	rf.heartBeat.receive()
+	rf.updateIfNewTerm(args.Term)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 对于来自落后任期的candidate, 直接拒绝
+	// 对于来自落后term的candidate, 直接拒绝
 	if args.Term < rf.persistedState.CurrentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.persistedState.CurrentTerm
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
 		return
-	}
-
-	// 如果arg的term已经更大了, 就要增大当前term. 增大的结果是, 当前term的votedFor重置
-	if args.Term > rf.persistedState.CurrentTerm {
-		rf.persistedState.CurrentTerm = args.Term
-		rf.persistedState.VotedFor = -1
-		rf.persist()
 	}
 
 	reply.Term = args.Term
-
+	// 如果当前term已经投过票且投的不是candidate, 返回false. 不能重新投
 	if rf.persistedState.VotedFor != -1 && rf.persistedState.VotedFor != args.CandidateId {
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
 
+	// 如果candidate的log还不如自己的新, 返回false.
 	logLength := len(rf.persistedState.Log)
 	lastLog := rf.persistedState.Log[logLength-1]
-
 	if args.LastLogTerm < lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex < logLength-1) {
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
 
-	log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
+	//log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
 	rf.persistedState.VotedFor = args.CandidateId
 	rf.persist()
-	atomic.StoreInt32(&rf.identity, IDENTITY_FOLLOWER)
+	rf.SetIdentity(IDENTITY_FOLLOWER)
 	reply.VoteGranted = true
 	return
-	//
-	//} else {
-	//	rf.mu.Lock()
-	//	defer rf.mu.Unlock()
-	//	if args.Term >= rf.persistedState.CurrentTerm {
-	//		reply.VoteGranted = true
-	//		reply.Term = args.Term
-	//		atomic.StoreInt32(&rf.identity, IDENTITY_FOLLOWER)
-	//		rf.persistedState.CurrentTerm = args.Term
-	//		rf.persist()
-	//		log.Printf("rf %d as a non-follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
-	//	} else {
-	//		reply.VoteGranted = false
-	//		reply.Term = rf.persistedState.CurrentTerm
-	//		log.Printf("rf %d as a non-follower rejected vote request from candidate due to outdated term%d\n", rf.me, args.CandidateId)
-	//	}
-	//}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -326,16 +334,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply, requestVoteReplyCh chan *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	log.Printf("rf %d has received request vote result from %d\n", rf.me, server)
-	if ok {
-		// 只要peer成功应答, 就可以拿到reply, 解析reply内容
-		requestVoteReplyCh <- reply
-	} else {
-		// 否则, reply就是nil
-		requestVoteReplyCh <- nil
-	}
+	//log.Printf("rf %d has received request vote result from %d\n", rf.me, server)
 	return ok
 }
 
@@ -356,14 +357,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//log.Printf("rf %d received heartbeat from leader %d\n", rf.me, args.LeaderId)
 	rf.heartBeat.receive()
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if args.Term > rf.persistedState.CurrentTerm {
-		rf.persistedState.CurrentTerm = args.Term
-		rf.persistedState.VotedFor = -1
-		rf.persist()
-		atomic.StoreInt32(&rf.identity, IDENTITY_FOLLOWER)
-	}
+	rf.updateIfNewTerm(args.Term)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -371,12 +365,15 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		return false
 	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if ok && reply != nil {
+		rf.updateIfNewTerm(reply.Term)
+	}
 	return ok
 }
 
 func (rf *Raft) SendHeartBeat() {
 	for !rf.killed() {
-		if IDENTITY_LEADER == atomic.LoadInt32(&rf.identity) {
+		if IDENTITY_LEADER == rf.GetIdentity() {
 			rf.mu.Lock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
@@ -396,7 +393,7 @@ func (rf *Raft) SendHeartBeat() {
 			}
 			rf.mu.Unlock()
 		}
-		time.Sleep(heartBeatInterval)
+		time.Sleep(HEARTBEAT_INTERVAL)
 	}
 }
 
@@ -442,6 +439,76 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) initElection() bool {
+	rf.mu.Lock()
+
+	// 发起选举.
+	log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
+	rf.SetIdentity(IDENTITY_CANDIDATE)
+
+	// 先准备好rpc消息 并且增大current Term
+	rf.persistedState.CurrentTerm += 1
+	rf.persistedState.VotedFor = rf.me
+	rf.persist()
+
+	currentTerm := rf.persistedState.CurrentTerm
+	lastLogIndex := len(rf.persistedState.Log) - 1
+	lastLogTerm := rf.persistedState.Log[lastLogIndex].Term
+	rf.mu.Unlock()
+
+	var vote int32
+	atomic.StoreInt32(&vote, 1)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		args := &RequestVoteArgs{
+			Term:         currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		}
+
+		reply := &RequestVoteReply{}
+		//log.Printf("rf %d send request vote to rf %d\n", rf.me, i)
+		server := i
+		go func() {
+			ok := rf.sendRequestVote(server, args, reply)
+			if ok {
+				if reply.VoteGranted {
+					atomic.AddInt32(&vote, 1)
+				} else {
+					rf.updateIfNewTerm(reply.Term)
+				}
+			}
+		}()
+	}
+
+	// 只能通过sleep一段时间来等待选举的反馈. 时间不宜太长, 也不应该随机化.
+	//  (或者: 通过channel监听requestVote的结果, 在vote成功后/全部回复后/超时后退出监听)
+	// 当然, 时间也不能太短. 至少应该有1, 2个rpc的ttl.
+	// 理想化来说, 这个时间应该小于另一个candidate苏醒(未发生) - 当前candidate苏醒(已发生)的时间差.
+	// 这个时间差的期望是(upper bound - lower bound) / server 数量
+	time.Sleep(HEARTBEAT_INTERVAL)
+	//log.Printf("rf %d has received %d vote\n", rf.me, vote)
+
+	// 如果已经是follower, 代表已经有leader/更优秀的candidate出现, 那么直接退出选举, 继续监听心跳
+	if rf.GetIdentity() == IDENTITY_FOLLOWER {
+		return true
+	}
+
+	// 否则, 若收到半数以上选票, 说明竞选成功, 直接成为leader
+	if int(atomic.LoadInt32(&vote)) >= (len(rf.peers)+1)/2 {
+		log.Printf("rf %d received majority vote and convert to leader on term %d\n", rf.me, rf.persistedState.CurrentTerm)
+		rf.makeLeader()
+		return true
+	}
+
+	// 否则, 说明竞选失败, 也没有其他成功者, 返回false, 继续下一轮选举
+	log.Printf("rf %d failed the election on term%d\n", rf.me, rf.persistedState.CurrentTerm)
+	return false
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
@@ -456,18 +523,17 @@ func (rf *Raft) ticker() {
 		// 选举超时的下限设定为 max(心跳间隔, 选举耗时). 还要考虑各节点选举超时的时间差和选举耗时的关系. 因此上限应该较大.来拉开时间差.
 		// 暂定leader心跳间隔为150 ms. 因此选举超时下限取心跳的3倍. 上限为心跳的10倍. (考虑到需要多轮投票来选举).
 
-		timeout := (3 + rand.Float64()*7) * float64(heartBeatInterval)
 		//log.Printf("rf %d has an election timeout of %d ms\n", rf.me, int(timeout/float64(time.Millisecond)))
-		time.Sleep(time.Duration(timeout))
+		time.Sleep(getRandomizedTimeout())
 
 		// wake up 后可能状态已经改变了. 所以再检查一次
 		if rf.killed() {
 			break
 		}
 
-		// 超时时间达到后, 检查过去时间内是否收到心跳. Leader不必检查.
+		// 超时时间达到后, 检查过去时间内是否收到心跳. 只有follower需要检查.
 		// heart beat自身带锁, 不必特地上锁
-		if IDENTITY_LEADER == atomic.LoadInt32(&rf.identity) {
+		if IDENTITY_FOLLOWER != rf.GetIdentity() {
 			//log.Printf("rf %d is leader, no need for heart beat\n", rf.me)
 			continue
 		}
@@ -477,93 +543,28 @@ func (rf *Raft) ticker() {
 			continue
 		}
 
-		rf.mu.Lock()
+		// 发起选举. 如果成功则直接退出. 否则继续选举
+		for !rf.initElection() {
 
-		// 发起选举.
-		log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
-		atomic.StoreInt32(&rf.identity, IDENTITY_CANDIDATE)
-
-		// 先准备好rpc消息 并且增大current Term
-		rf.persistedState.CurrentTerm += 1
-		rf.persistedState.VotedFor = rf.me
-		rf.persist()
-
-		currentTerm := rf.persistedState.CurrentTerm
-		lastLogIndex := len(rf.persistedState.Log) - 1
-		lastLogTerm := rf.persistedState.Log[lastLogIndex].Term
-		rf.mu.Unlock()
-
-		requestVoteChan := make(chan *RequestVoteReply, len(rf.peers)-1)
-		for i := 0; i < len(rf.peers); i++ {
-			if i == rf.me {
-				continue
-			}
-			args := &RequestVoteArgs{
-				Term:         currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			}
-
-			reply := &RequestVoteReply{}
-			log.Printf("rf %d send request vote to rf %d\n", rf.me, i)
-			go rf.sendRequestVote(i, args, reply, requestVoteChan)
 		}
-
-		// channel只会在每次发出选举时被使用, 不存在并发问题
-		vote := 1
-		var cnt int
-		for reply := range requestVoteChan {
-			if reply != nil && reply.VoteGranted {
-				vote++
-			} else if reply != nil {
-				rf.mu.Lock()
-				if reply.Term > rf.persistedState.CurrentTerm {
-					rf.persistedState.CurrentTerm = reply.Term
-					rf.persistedState.VotedFor = -1
-					rf.persist()
-					atomic.StoreInt32(&rf.identity, IDENTITY_FOLLOWER)
-				}
-				rf.mu.Unlock()
-			}
-			cnt++
-			if cnt >= len(rf.peers)-1 || vote >= (len(rf.peers)+1)/2 {
-				break
-			}
-		}
-		//close(requestVoteChan)
-		log.Printf("rf %d has received %d vote\n", rf.me, vote)
-
-		if vote >= (len(rf.peers)+1)/2 {
-			log.Printf("rf %d received majority vote and transfer to leader\n", rf.me)
-			rf.makeLeader()
-		} else {
-			log.Printf("rf %d failed the election\n", rf.me)
-		}
-
 	}
 }
 
 func (rf *Raft) makeLeader() {
-
-	// 在make leader前, 可能已经被其他leader掉了requestVote而降为了follower
-	if IDENTITY_CANDIDATE != atomic.LoadInt32(&rf.identity) {
-		log.Printf("rf %d tried to become leader but is no longer a candidate\n", rf.me)
-		return
-	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	nextIndex := make([]int, len(rf.peers))
 	idx := len(rf.persistedState.Log)
-	for i, _ := range nextIndex {
+	for i := range nextIndex {
 		nextIndex[i] = idx
 	}
 	rf.leaderState = NewLeaderState(rf)
+	rf.SetIdentity(IDENTITY_LEADER)
 
-	atomic.StoreInt32(&rf.identity, IDENTITY_LEADER)
-	log.Printf("rf %d has became the leader", rf.me)
+	log.Println("🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉")
+	log.Printf("rf %d has became the leader\n", rf.me)
+	log.Println("🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉")
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -575,14 +576,11 @@ func (rf *Raft) makeLeader() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-var rfIdSeq = 0
 
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
 	rf := &Raft{}
-	rf.id = rfIdSeq
-	rfIdSeq++
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
@@ -593,7 +591,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		mu:       sync.Mutex{},
 		received: false,
 	}
-	atomic.StoreInt32(&rf.identity, IDENTITY_FOLLOWER)
+	rf.SetIdentity(IDENTITY_FOLLOWER)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -603,4 +601,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.SendHeartBeat()
 	//log.Printf("rf %d (id: %d)started\n", me, rf.id)
 	return rf
+}
+
+// for utility only
+func init() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 }
