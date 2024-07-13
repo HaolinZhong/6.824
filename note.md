@@ -160,7 +160,7 @@ $ bash test-mr.sh
 
 
 
-# Raft A
+# Raft A Leader Election
 
 
 
@@ -319,14 +319,6 @@ Run `go test -run 2A -race` to test your 2A code.
 
 
 
-## Paper
-
-
-
-### State
-
-
-
 
 
 ## 思想
@@ -420,3 +412,46 @@ Run `go test -run 2A -race` to test your 2A code.
 - candidate / leader发现自己的term比其他人小时, 立马转换为follower, 并更新currentTerm
 - server在收到来自过去term的请求时, 直接忽略请求.
 - 一个server在向其他多个节点发送请求时, 会并发发送
+
+
+
+
+
+# Raft B log
+
+
+
+## Goal
+
+- Implement the leader and follower code to append new log entries, so that the `go test -run 2B -race` tests pass.
+
+
+
+## Hint
+
+- 首先尝试pass TestBasicAgree2B()
+  - 首先实现Start, 然后是AppendEntries
+- 需要实现leader election的restriction
+- One way to fail to reach agreement in the early Lab 2B tests is to hold repeated elections even though the leader is alive. Look for bugs in election timer management, or not sending out heartbeats immediately after winning an election
+- 对于无限循环的loop, 不要让他无脑循环. Use Go's [condition variables](https://golang.org/pkg/sync/#Cond) 或者sleep 10ms 来避免无脑循环.
+- 测试结果会显示real time (现实世界真实用时) 和 user time (cpu耗时).
+  - 如果花费了超过60s的real time 或者 5s的user time, 一般是哪里出了问题. 
+
+
+
+## Design
+
+- To bring a follower’s log into consistency with its own, the leader must 
+  - find the latest log entry where the two logs agree, 
+  - delete any entries in the follower’s log after that point, 
+  - send the follower all of the leader’s entries after that point. 
+- All of these actions happen in response to the consistency check performed by AppendEntries RPCs.
+- The leader maintains a `nextIndex` for each follower, which is the index of the next log entry the leader will send to that follower. 
+  - When a leader first comes to power, it initializes all `nextIndex` values to the index just after the last one in its log
+  - If a follower’s log is inconsistent with the leader’s, the AppendEntries consistency check will fail in the next AppendEntries RPC.
+  - **After a rejection, the leader decrements nextIndex and retries the AppendEntries RPC.**
+    - Eventually nextIndex will reach a point where the leader and follower logs match. 
+    - When this happens, AppendEntries will succeed, which removes any conflicting entries in the follower’s log and appends entries from the leader’s log (if any). 
+    - Once AppendEntries succeeds, the follower’s log is consistent with the leader’s, and it will remain that way for the rest of the term.
+
+- 规定: `prevLogTerm` 初始化为-1

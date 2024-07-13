@@ -145,6 +145,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 		}
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
+	log.Printf("check logs 148: i = %d, commandIndex = %d\n", i, m.CommandIndex)
 	cfg.logs[i][m.CommandIndex] = v
 	if m.CommandIndex > cfg.maxIndex {
 		cfg.maxIndex = m.CommandIndex
@@ -181,6 +182,7 @@ const SnapShotInterval = 10
 func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 	lastApplied := 0
 	for m := range applyCh {
+		//log.Printf("command received: valid=%t, index=%d, lastApplied=%d\n", m.CommandValid, m.CommandIndex, lastApplied)
 		if m.SnapshotValid {
 			//DPrintf("Installsnapshot %v %v\n", m.SnapshotIndex, lastApplied)
 			cfg.mu.Lock()
@@ -447,6 +449,8 @@ func (cfg *config) nCommitted(index int) (int, interface{}) {
 			}
 			count += 1
 			cmd = cmd1
+		} else {
+			//log.Printf("test: not ok to get log from cfg.logs. i = %d, index = %d\n", i, index)
 		}
 	}
 	return count, cmd
@@ -513,6 +517,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				index1, _, ok := rf.Start(cmd)
 				if ok {
 					index = index1
+					//log.Printf("test: index returned is %d \n", index)
 					break
 				}
 			}
@@ -526,6 +531,7 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				nd, cmd1 := cfg.nCommitted(index)
 				if nd > 0 && nd >= expectedServers {
 					// committed
+					//log.Printf("test: cmd: %d, cmd1: %d\n", cmd, cmd1)
 					if cmd1 == cmd {
 						// and it was the Command we submitted.
 						return index

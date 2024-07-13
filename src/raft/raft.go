@@ -52,9 +52,17 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// log的标准格式就是一个command加一个term
 type Log struct {
-	Command string
+	Command interface{}
 	Term    int
+}
+
+func (l *Log) copy() *Log {
+	return &Log{
+		Command: l.Command,
+		Term:    l.Term,
+	}
 }
 
 // A Go object implementing a single Raft peer.
@@ -77,6 +85,7 @@ type Raft struct {
 
 	// 从这里开始, 不需要mu保护
 	heartBeat *HeartBeat
+	applyCh   chan ApplyMsg
 }
 
 const (
@@ -103,11 +112,6 @@ type PersistedState struct {
 
 func NewPersistedState() *PersistedState {
 	log := make([]Log, 0)
-	// dummy log 初始化
-	log = append(log, Log{
-		Command: "dummy",
-		Term:    0,
-	})
 	return &PersistedState{
 		CurrentTerm: 0,
 		VotedFor:    -1, // -1表示null
@@ -121,7 +125,7 @@ type LeaderState struct {
 }
 
 func NewLeaderState(rf *Raft) *LeaderState {
-	nextIndexInit := len(rf.persistedState.Log)
+	nextIndexInit := len(rf.persistedState.Log) + 1
 	nextIndex := make([]int, len(rf.peers))
 	for i := 0; i < len(nextIndex); i++ {
 		nextIndex[i] = nextIndexInit
@@ -130,6 +134,14 @@ func NewLeaderState(rf *Raft) *LeaderState {
 		nextIndex:  nextIndex,
 		matchIndex: make([]int, len(rf.peers)),
 	}
+}
+
+func (l *LeaderState) decreaseNextIndex(server int) {
+	l.nextIndex[server]--
+}
+
+func (l *LeaderState) increaseNextIndex(server int) {
+	l.nextIndex[server]++
 }
 
 type HeartBeat struct {
@@ -234,8 +246,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // 如果peer给出的term大于自身了, 就需要增大自身的term以及相关的属性, 且明确自身是follower.
 // 这个方法可以无脑放到rpc方法的最开始, 以及读取rpc reply的方法中
 func (rf *Raft) updateIfNewTerm(term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	if term > rf.persistedState.CurrentTerm {
 		rf.persistedState.CurrentTerm = term
 		rf.persistedState.VotedFor = -1
@@ -268,42 +278,46 @@ type RequestVoteReply struct {
 // 整个方法是上锁的, 因此多次requestVote会顺序执行.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	rf.heartBeat.receive()
-	rf.updateIfNewTerm(args.Term)
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.updateIfNewTerm(args.Term) // don't change
 
 	// 对于来自落后term的candidate, 直接拒绝
 	if args.Term < rf.persistedState.CurrentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.persistedState.CurrentTerm
-		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
+		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
 		return
 	}
 
 	reply.Term = args.Term
 	// 如果当前term已经投过票且投的不是candidate, 返回false. 不能重新投
 	if rf.persistedState.VotedFor != -1 && rf.persistedState.VotedFor != args.CandidateId {
-		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
+		log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
 
 	// 如果candidate的log还不如自己的新, 返回false.
 	logLength := len(rf.persistedState.Log)
-	lastLog := rf.persistedState.Log[logLength-1]
-	if args.LastLogTerm < lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex < logLength-1) {
-		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
+	var lastLog *Log = nil
+	if logLength > 0 {
+		lastLog = &rf.persistedState.Log[logLength-1]
+	}
+	if lastLog != nil && (args.LastLogTerm < lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex < logLength)) {
+		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
+	// grant vote时认为收到heart beat
+	rf.heartBeat.receive()
 
-	//log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
+	log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
 	rf.persistedState.VotedFor = args.CandidateId
 	rf.persist()
 	rf.SetIdentity(IDENTITY_FOLLOWER)
 	reply.VoteGranted = true
+	rf.heartBeat.receive() // 只有成功vote时, 才认为得到leader心跳
 	return
 }
 
@@ -336,7 +350,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	//log.Printf("rf %d has received request vote result from %d\n", rf.me, server)
+	log.Printf("rf %d has received request vote result from %d\n", rf.me, server)
 	return ok
 }
 
@@ -345,30 +359,260 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []string
+	Entries      *Log
 	LeaderCommit int
+}
+
+func (a *AppendEntriesArgs) copy() *AppendEntriesArgs {
+	return &AppendEntriesArgs{
+		Term:         a.Term,
+		LeaderId:     a.LeaderId,
+		PrevLogIndex: a.PrevLogIndex,
+		PrevLogTerm:  a.PrevLogTerm,
+		Entries:      a.Entries,
+		LeaderCommit: a.LeaderCommit,
+	}
+}
+
+// 专门用来发送最新收到的log的
+func NewAppendEntriesArg(rf *Raft, currentLogIndex int) *AppendEntriesArgs {
+	var prevLogIndex, prevLogTerm int
+	prevLogIndex = currentLogIndex - 1
+	prevLogArrIdx := prevLogIndex - 1
+	if prevLogArrIdx < len(rf.persistedState.Log) && prevLogArrIdx >= 0 {
+		prevLogTerm = rf.persistedState.Log[prevLogArrIdx].Term
+	} else {
+		prevLogTerm = 0
+	}
+
+	return &AppendEntriesArgs{
+		Term:         rf.persistedState.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      rf.persistedState.Log[currentLogIndex-1].copy(),
+		LeaderCommit: rf.commitIndex,
+	}
+}
+
+// 专用于给某个server发送失败时进行recover的
+func NewServerSpecificAppendEntryArg(rf *Raft, server int) *AppendEntriesArgs {
+	var prevLogIndex, prevLogTerm int
+	prevLogIndex = rf.leaderState.nextIndex[server] - 1
+
+	if prevLogIndex-1 < len(rf.persistedState.Log) && prevLogIndex >= 1 {
+		prevLogTerm = rf.persistedState.Log[prevLogIndex-1].Term
+	} else {
+		prevLogTerm = rf.persistedState.CurrentTerm
+	}
+
+	return &AppendEntriesArgs{
+		Term:         rf.persistedState.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      rf.persistedState.Log[prevLogIndex].copy(),
+		LeaderCommit: rf.commitIndex,
+	}
+}
+
+func NewHeartBeatArg(rf *Raft, server int) *AppendEntriesArgs {
+	var prevLogIndex, prevLogTerm int
+	prevLogIndex = rf.leaderState.nextIndex[server] - 1
+
+	if prevLogIndex-1 < len(rf.persistedState.Log) && prevLogIndex >= 1 {
+		prevLogTerm = rf.persistedState.Log[prevLogIndex-1].Term
+	} else {
+		prevLogTerm = rf.persistedState.CurrentTerm
+	}
+
+	return &AppendEntriesArgs{
+		Term:         rf.persistedState.CurrentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      nil,
+		LeaderCommit: rf.commitIndex,
+	}
 }
 
 type AppendEntriesReply struct {
 	Term    int
-	Success int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	//log.Printf("rf %d received heartbeat from leader %d\n", rf.me, args.LeaderId)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// arg term < 当前term时, 拒绝 (且不认为这是一条合理消息)
+	if args.Term < rf.persistedState.CurrentTerm {
+		reply.Success = false
+		reply.Term = rf.persistedState.CurrentTerm
+		return
+	}
+
+	argPrevLogArrIdx := args.PrevLogIndex - 1
+	// idx超出了边界, 无法append
+	if argPrevLogArrIdx >= len(rf.persistedState.Log) || argPrevLogArrIdx < -1 {
+		reply.Success = false
+		reply.Term = rf.persistedState.CurrentTerm
+		return
+	}
+
+	// term 检查, 判断prevLog的term是否匹配
+	// arrIdx = -1时, 说明这是第一条log, 不需要检查prev log的term,
+	if argPrevLogArrIdx > -1 {
+		// term检查
+		myPrevLog := rf.persistedState.Log[argPrevLogArrIdx]
+		if myPrevLog.Term != args.PrevLogTerm {
+			reply.Success = false
+			reply.Term = rf.persistedState.CurrentTerm
+			return
+		}
+	}
+
+	// 完成检查, 到这里认为是合理请求
 	rf.heartBeat.receive()
 	rf.updateIfNewTerm(args.Term)
+
+	argCurrentLogIndex, argCurrentLogArrIdx := args.PrevLogIndex+1, argPrevLogArrIdx+1
+
+	// argPrevLogArrIdx < len(log)  =>  argCurrentLogArrIdx <= len(log)
+
+	// 还需要检查, current log和arg incoming log有无冲突
+	// 存在current log
+	if argCurrentLogArrIdx < len(rf.persistedState.Log) {
+		myCurrentLog := rf.persistedState.Log[argCurrentLogArrIdx]
+		if myCurrentLog.Term != args.Term {
+			// 发生冲突时, 删除myCurrentLog及所有后续, 然后加上新的
+			rf.persistedState.Log = rf.persistedState.Log[:argCurrentLogArrIdx]
+			log.Printf("rf %d removed conflicted log with index %d\n", rf.me, myCurrentLog)
+			if args.Entries != nil {
+				rf.persistedState.Log = append(rf.persistedState.Log, *args.Entries)
+				log.Printf("rf %d persisted log with index %d\n", rf.me, argCurrentLogIndex)
+			}
+		} else {
+			// 不需要append了
+		}
+	} else {
+		// 不存在current log, 说明argCurrentLogArrIdx == len(log), 直接append
+		if args.Entries != nil {
+			rf.persistedState.Log = append(rf.persistedState.Log, *args.Entries)
+		}
+	}
+
+	rf.persist()
+
+	rf.commitUntilTargetIfApplicable(args.LeaderCommit)
+
+	reply.Success = true
+	reply.Term = rf.persistedState.CurrentTerm
+	return
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) commitUntilTargetIfApplicable(targetIndex int) {
+	if targetIndex > rf.commitIndex {
+		var ub int
+		if targetIndex <= len(rf.persistedState.Log) {
+			ub = targetIndex
+		} else {
+			ub = len(rf.persistedState.Log)
+		}
+		log.Printf("rf %d: leader commmit is %d, my commit is %d, commit ub is %d\n", rf.me, targetIndex, rf.commitIndex, ub)
+		//fmt.Println(rf.persistedState.Log)
+		for i := rf.commitIndex + 1; i <= ub; i++ {
+			commandIndex := i
+			command := rf.persistedState.Log[commandIndex-1].Command
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      command,
+				CommandIndex: commandIndex,
+			}
+		}
+		rf.commitIndex = ub
+	}
+}
+
+func (rf *Raft) sendAppendEntriesAsHeartBeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	if rf.killed() {
 		return false
 	}
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	if ok && reply != nil {
+		rf.mu.Lock()
 		rf.updateIfNewTerm(reply.Term)
+		rf.mu.Unlock()
 	}
 	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply, counter *int32) {
+	if rf.killed() {
+		return
+	}
+	// 循环的目的是让传入的arg里的log entry被persist成功. 不过, 循环可能会修改args.
+	// 最后, 原本的arg entry被persist时, arg的prevLogIndex会回到和原本的prevLogIndex一致.
+	targetPrevIndex := args.PrevLogIndex
+	for !rf.killed() {
+		// 每一轮都要更新arg和reply的地址!
+		roundArgs := args.copy()
+		roundReply := &AppendEntriesReply{}
+		received := int32(0)
+		// 不能依赖laprpc自身的timeout, 因为他给的timeout太长了!
+		go func() {
+			log.Printf("rf %d as leader send rf %d command Index %d\n", rf.me, server, roundArgs.PrevLogIndex+1)
+			ok := rf.peers[server].Call("Raft.AppendEntries", roundArgs, roundReply)
+			if ok {
+				atomic.StoreInt32(&received, 1)
+			}
+		}()
+		time.Sleep(100 * time.Millisecond)
+		if 1 != atomic.LoadInt32(&received) || roundReply == nil {
+			// avoid overly frequent call
+			log.Printf("rf %d failed to respond the call with command Index %d\n", server, args.PrevLogIndex+1)
+			rf.mu.Lock()
+			args.Term = rf.persistedState.CurrentTerm
+			args.LeaderCommit = rf.commitIndex
+			rf.mu.Unlock()
+			continue
+		}
+
+		// result is ok and we have reply
+		rf.mu.Lock()
+		rf.updateIfNewTerm(roundReply.Term)
+		rf.mu.Unlock()
+		// may not be leader anymore
+		if rf.GetIdentity() != IDENTITY_LEADER {
+			break
+		}
+
+		if !roundReply.Success {
+			rf.mu.Lock()
+			// decrease the index, change the log to be sent, repopulate the arg
+			rf.leaderState.decreaseNextIndex(server)
+			log.Printf("rf %d failed to acknowledge the entry. now set it next index to %d\n", server, rf.leaderState.nextIndex[server])
+			args = NewServerSpecificAppendEntryArg(rf, server)
+			rf.mu.Unlock()
+			continue
+		}
+
+		rf.mu.Lock()
+		rf.leaderState.increaseNextIndex(server)
+		if args.PrevLogIndex == targetPrevIndex {
+			// add counter to let the caller know this server has persisted the log
+			atomic.AddInt32(counter, 1)
+			rf.mu.Unlock()
+			log.Printf("rf %d as leader received follower %d success persistence message for log %d \n", rf.me, server, args.PrevLogIndex+1)
+			break
+		} else {
+			// there are still some log left to be sync. re populate the log and continue the loop.
+			args = NewServerSpecificAppendEntryArg(rf, server)
+			log.Printf("resume rf %d and send with prevLog %d\n", server, args.PrevLogIndex)
+		}
+		rf.mu.Unlock()
+	}
 }
 
 func (rf *Raft) SendHeartBeat() {
@@ -379,17 +623,9 @@ func (rf *Raft) SendHeartBeat() {
 				if i == rf.me {
 					continue
 				}
-				prevLogIndex := rf.leaderState.nextIndex[i] - 1
-				args := AppendEntriesArgs{
-					Term:         rf.persistedState.CurrentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: prevLogIndex,
-					PrevLogTerm:  rf.persistedState.Log[prevLogIndex].Term,
-					Entries:      nil,
-					LeaderCommit: rf.commitIndex,
-				}
+				args := NewHeartBeatArg(rf, i)
 				//log.Printf("rf leader %d is sending heart beat to rf %d \n", rf.me, i)
-				go rf.sendAppendEntries(i, &args, &AppendEntriesReply{})
+				go rf.sendAppendEntriesAsHeartBeat(i, args, &AppendEntriesReply{})
 			}
 			rf.mu.Unlock()
 		}
@@ -412,11 +648,66 @@ func (rf *Raft) SendHeartBeat() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	//isLeader := true
-
 	// Your code here (2B).
+	isLeader := rf.GetIdentity() == IDENTITY_LEADER && !rf.killed()
+	if !isLeader {
+		return index, term, false
+	}
 
-	return index, term, IDENTITY_LEADER == atomic.LoadInt32(&rf.identity)
+	// Leader接受到消息后, 首先将command persist到log中
+	rf.mu.Lock()
+	rf.persistedState.Log = append(rf.persistedState.Log, Log{
+		Command: command,
+		Term:    rf.persistedState.CurrentTerm,
+	})
+	rf.persist()
+
+	commandIndex := len(rf.persistedState.Log)
+	log.Printf("rf %d as leader persisted command index %d\n", rf.me, commandIndex)
+
+	// 然后并发发起appendEntries来将command送给其他peers
+	// 如果follower宕机/不响应, 无限重试, 直到所有follower最终存住全部log (不过, 这一步不会阻塞当前的start方法)
+
+	// 用counter来记录append entry 结果
+	var counter int32 = 1
+	majority := int32((len(rf.peers) + 1) / 2)
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		args := NewAppendEntriesArg(rf, commandIndex)
+		log.Printf("rf %d as leader appending entries to rf %d with log index %d \n", rf.me, i, args.PrevLogIndex+1)
+		go rf.sendAppendEntries(i, args, &AppendEntriesReply{}, &counter)
+	}
+	rf.mu.Unlock()
+
+	/**
+	"当entry被安全地复制后"(或者说, committed), 正式让state machine执行这一command (通过applyCh). 等待state machine执行结束后, 将结果返回.
+	committed的定义是, 在多数机器上, log被成功persist
+	因此, 这里在并发发送完请求后, 真正阻塞的条件是: 收到多数机器的persist成功消息
+	*/
+
+	// 等待多数机器persist成功
+	for rf.GetIdentity() == IDENTITY_LEADER && atomic.LoadInt32(&counter) < majority {
+		time.Sleep(10 * time.Millisecond)
+		//log.Printf("rf %d as leader waiting for appending entries. persisted: %d, majority: %d\n", rf.me, atomic.LoadInt32(&counter), majority)
+	}
+	rf.mu.Lock()
+	rf.commitIndex++
+	defer rf.mu.Unlock()
+	//log.Printf("rf %d as leader commited command %s\n", rf.me, command)
+
+	// 交给state machine执行
+	rf.applyCh <- ApplyMsg{
+		CommandValid: true,
+		Command:      command,
+		CommandIndex: commandIndex,
+	}
+
+	// 确认到log被commit后, leader需要维护更新其已知的最新被commit的index (volatile. commitIndex)
+	// 后续的appendEntries(包括心跳)会发出这个index. Follower收到后, 确认log被commit, 就可以apply到local的state machine
+
+	return rf.commitIndex, rf.persistedState.CurrentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -431,7 +722,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	//log.Printf("rf %d was killed\n", rf.me)
+	log.Printf("rf %d was killed\n", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -443,7 +734,7 @@ func (rf *Raft) initElection() bool {
 	rf.mu.Lock()
 
 	// 发起选举.
-	log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
+	//log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
 	rf.SetIdentity(IDENTITY_CANDIDATE)
 
 	// 先准备好rpc消息 并且增大current Term
@@ -452,8 +743,13 @@ func (rf *Raft) initElection() bool {
 	rf.persist()
 
 	currentTerm := rf.persistedState.CurrentTerm
-	lastLogIndex := len(rf.persistedState.Log) - 1
-	lastLogTerm := rf.persistedState.Log[lastLogIndex].Term
+	lastLogIndex := len(rf.persistedState.Log)
+	var lastLogTerm int
+	if lastLogIndex == 0 {
+		lastLogTerm = rf.persistedState.CurrentTerm
+	} else {
+		lastLogTerm = rf.persistedState.Log[lastLogIndex-1].Term
+	}
 	rf.mu.Unlock()
 
 	var vote int32
@@ -478,7 +774,9 @@ func (rf *Raft) initElection() bool {
 				if reply.VoteGranted {
 					atomic.AddInt32(&vote, 1)
 				} else {
+					rf.mu.Lock()
 					rf.updateIfNewTerm(reply.Term)
+					rf.mu.Unlock()
 				}
 			}
 		}()
@@ -501,11 +799,12 @@ func (rf *Raft) initElection() bool {
 	if int(atomic.LoadInt32(&vote)) >= (len(rf.peers)+1)/2 {
 		log.Printf("rf %d received majority vote and convert to leader on term %d\n", rf.me, rf.persistedState.CurrentTerm)
 		rf.makeLeader()
+		// todo: 也许需要在选举成功后直接发送appendEntries
 		return true
 	}
 
 	// 否则, 说明竞选失败, 也没有其他成功者, 返回false, 继续下一轮选举
-	log.Printf("rf %d failed the election on term%d\n", rf.me, rf.persistedState.CurrentTerm)
+	//log.Printf("rf %d failed the election on term%d\n", rf.me, rf.persistedState.CurrentTerm)
 	return false
 }
 
@@ -545,7 +844,6 @@ func (rf *Raft) ticker() {
 
 		// 发起选举. 如果成功则直接退出. 否则继续选举
 		for !rf.initElection() {
-
 		}
 	}
 }
@@ -555,7 +853,7 @@ func (rf *Raft) makeLeader() {
 	defer rf.mu.Unlock()
 
 	nextIndex := make([]int, len(rf.peers))
-	idx := len(rf.persistedState.Log)
+	idx := len(rf.persistedState.Log) + 1
 	for i := range nextIndex {
 		nextIndex[i] = idx
 	}
@@ -584,6 +882,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.persistedState = NewPersistedState()
