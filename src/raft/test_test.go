@@ -224,7 +224,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	// 3 of 5 followers disconnect
 	leader := cfg.checkOneLeader()
 
-	log.Println("test: disconnected 3 servers")
+	log.Println("================== test: disconnected 3 servers =========================")
 	cfg.disconnect((leader + 1) % servers)
 	cfg.disconnect((leader + 2) % servers)
 	cfg.disconnect((leader + 3) % servers)
@@ -239,11 +239,13 @@ func TestFailNoAgree2B(t *testing.T) {
 
 	time.Sleep(2 * RaftElectionTimeout)
 
+	log.Println("================= test: timeout achieved ====================")
+
 	n, _ := cfg.nCommitted(index)
 	if n > 0 {
 		t.Fatalf("%v committed but no majority", n)
 	}
-	log.Println("test: repair connect")
+	log.Println("================== test: repair connect ======================")
 	// repair
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)

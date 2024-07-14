@@ -145,7 +145,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 		}
 	}
 	_, prevok := cfg.logs[i][m.CommandIndex-1]
-	log.Printf("check logs 148: i = %d, commandIndex = %d\n", i, m.CommandIndex)
+	//log.Printf("check logs 148: i = %d, commandIndex = %d\n", i, m.CommandIndex)
 	cfg.logs[i][m.CommandIndex] = v
 	if m.CommandIndex > cfg.maxIndex {
 		cfg.maxIndex = m.CommandIndex
