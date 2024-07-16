@@ -416,40 +416,48 @@ func TestBackup2B(t *testing.T) {
 	cfg.one(rand.Int(), servers, true)
 
 	// put leader and one follower in a partition
+	log.Println("========================= put leader and one follower in a partition ====================================")
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
+	log.Println("========================= submit lots of commands that won't commit ====================================")
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader1].Start(rand.Int())
 	}
 
 	time.Sleep(RaftElectionTimeout / 2)
 
+	log.Println("========================= remove previous partition ====================================")
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// allow other partition to recover
+	log.Println("========================= allow other partition to recover ====================================")
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
 
 	// lots of successful commands to new group.
+	log.Println("========================= lots of successful commands to new group. ====================================")
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
 	// now another partitioned leader and one follower
+	log.Println("========================= now another partitioned leader and one follower ====================================")
 	leader2 := cfg.checkOneLeader()
 	other := (leader1 + 2) % servers
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	log.Printf("========================= disconnect rf %d ============================\n", other)
 	cfg.disconnect(other)
 
 	// lots more commands that won't commit
+	log.Println("========================= lots more commands that won't commit ====================================")
 	for i := 0; i < 50; i++ {
 		cfg.rafts[leader2].Start(rand.Int())
 	}
@@ -457,6 +465,7 @@ func TestBackup2B(t *testing.T) {
 	time.Sleep(RaftElectionTimeout / 2)
 
 	// bring original leader back to life,
+	log.Printf("========================= bring original leader %d and %d, %d back to life ====================================\n", leader1, (leader1+1)%servers, other)
 	for i := 0; i < servers; i++ {
 		cfg.disconnect(i)
 	}
@@ -465,11 +474,13 @@ func TestBackup2B(t *testing.T) {
 	cfg.connect(other)
 
 	// lots of successful commands to new group.
+	log.Println("========================= lots of successful commands to new group. ====================================")
 	for i := 0; i < 50; i++ {
 		cfg.one(rand.Int(), 3, true)
 	}
 
 	// now everyone
+	log.Println("========================= now everyone ====================================")
 	for i := 0; i < servers; i++ {
 		cfg.connect(i)
 	}
