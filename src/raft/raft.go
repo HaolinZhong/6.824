@@ -158,7 +158,7 @@ func (l *LeaderState) increaseNextIndexTo(server, targetIndex int) {
 
 func (l *LeaderState) increaseMatchIndexTo(server, targetIndex int) {
 	if targetIndex > l.matchIndex[server] {
-		log.Printf("increase rf %d 's match index to %d", server, targetIndex)
+		//log.Printf("increase rf %d 's match index to %d", server, targetIndex)
 		l.matchIndex[server] = targetIndex
 	}
 }
@@ -215,7 +215,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	err := e.Encode(rf.persistedState)
+	err := e.Encode(*rf.persistedState)
 	if err != nil {
 		return
 	}
@@ -230,17 +230,15 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var persistedState PersistedState
 	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	if d.Decode(&persistedState) == nil {
+		rf.persistedState = &persistedState
+	} else {
+		log.Println("error when decode log")
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -305,14 +303,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.persistedState.CurrentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.persistedState.CurrentTerm
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated term\n", rf.me, args.CandidateId)
 		return
 	}
 
 	reply.Term = args.Term
 	// 如果当前term已经投过票且投的不是candidate, 返回false. 不能重新投
 	if rf.persistedState.VotedFor != -1 && rf.persistedState.VotedFor != args.CandidateId {
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to already voted in this term", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
@@ -324,14 +322,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLog = &rf.persistedState.Log[logLength-1]
 	}
 	if lastLog != nil && (args.LastLogTerm < lastLog.Term || (args.LastLogTerm == lastLog.Term && args.LastLogIndex < logLength)) {
-		log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
+		//log.Printf("rf %d as a follower rejected vote request from candidate %d due to outdated log", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		return
 	}
 	// grant vote时认为收到heart beat
 	rf.heartBeat.receive()
 
-	log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
+	//log.Printf("rf %d as a follower approved vote request from candidate %d\n", rf.me, args.CandidateId)
 	rf.persistedState.VotedFor = args.CandidateId
 	rf.persist()
 	rf.SetIdentity(IDENTITY_FOLLOWER)
@@ -479,7 +477,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.persistedState.CurrentTerm {
 		reply.Success = false
 		reply.Term = rf.persistedState.CurrentTerm
-		log.Printf("rf %d rejected append entry due to arg term %d < my term %d\n", rf.me, args.Term, rf.persistedState.CurrentTerm)
+		//log.Printf("rf %d rejected append entry due to arg term %d < my term %d\n", rf.me, args.Term, rf.persistedState.CurrentTerm)
 		return
 	}
 
@@ -491,7 +489,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if argPrevLogArrIdx >= len(rf.persistedState.Log) || argPrevLogArrIdx < -1 {
 		reply.Success = false
 		reply.Term = rf.persistedState.CurrentTerm
-		log.Printf("rf %d rejected append entry due to arg prev log index %d, my log length%d\n", rf.me, args.PrevLogIndex, len(rf.persistedState.Log))
+		//log.Printf("rf %d rejected append entry due to arg prev log index %d, my log length%d\n", rf.me, args.PrevLogIndex, len(rf.persistedState.Log))
 		return
 	}
 
@@ -503,7 +501,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if myPrevLog.Term != args.PrevLogTerm {
 			reply.Success = false
 			reply.Term = rf.persistedState.CurrentTerm
-			log.Printf("rf %d rejected append entry due to arg prev log term %d, my prev log term%d\n", rf.me, args.PrevLogTerm, myPrevLog.Term)
+			//log.Printf("rf %d rejected append entry due to arg prev log term %d, my prev log term%d\n", rf.me, args.PrevLogTerm, myPrevLog.Term)
 			return
 		}
 	}
@@ -513,34 +511,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//argCurrentLogIndex := args.PrevLogIndex + 1
 	argCurrentLogArrIdx := argPrevLogArrIdx + 1
-
-	// argPrevLogArrIdx < len(log)  =>  argCurrentLogArrIdx <= len(log)
-
-	// 还需要检查, current log和arg incoming log有无冲突
-	// 存在current log
-	//if argCurrentLogArrIdx < len(rf.persistedState.Log) {
-	//	//myCurrentLog := rf.persistedState.Log[argCurrentLogArrIdx]
-	//	rf.persistedState.Log = rf.persistedState.Log[:argCurrentLogIndex]
-	//if args.Entries != nil && myCurrentLog.Term != args.Entries.Term {
-	//	// 发生冲突时, 删除myCurrentLog及所有后续, 然后加上新的
-	//	//log.Printf("rf %d removed conflicted log with index %d\n", rf.me, myCurrentLog)
-	//	if args.Entries != nil {
-	//		rf.persistedState.Log = append(rf.persistedState.Log, *args.Entries)
-	//		log.Printf("rf %d persisted log with index %d (494)\n", rf.me, argCurrentLogIndex)
-	//		//fmt.Println(rf.persistedState.Log)
-	//	}
-	//} else {
-	//	// 不需要append了
-	//}
-
-	//} else {
-	//	// 不存在current log, 说明argCurrentLogArrIdx == len(log), 直接append
-	//	if args.Entries != nil {
-	//		rf.persistedState.Log = append(rf.persistedState.Log, *args.Entries)
-	//		log.Printf("rf %d persisted log with index %d (509)\n", rf.me, argCurrentLogIndex)
-	//		//fmt.Println(rf.persistedState.Log)
-	//	}
-	//}
 
 	if args.Entries != nil {
 		if argCurrentLogArrIdx < len(rf.persistedState.Log) {
@@ -566,7 +536,7 @@ func (rf *Raft) commitUntilTargetIfApplicable(targetIndex int) {
 		} else {
 			ub = len(rf.persistedState.Log)
 		}
-		log.Printf("rf %d: leader commmit is %d, my commit is %d, commit ub is %d\n", rf.me, targetIndex, rf.commitIndex, ub)
+		//log.Printf("rf %d: leader commit is %d, my commit is %d, commit ub is %d\n", rf.me, targetIndex, rf.commitIndex, ub)
 		//fmt.Println(rf.persistedState.Log)
 		for i := rf.commitIndex + 1; i <= ub; i++ {
 			commandIndex := i
@@ -681,7 +651,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		rf.leaderState.increaseMatchIndexTo(server, args.PrevLogIndex+len(args.Entries))
 		if rf.leaderState.nextIndex[server] == len(rf.persistedState.Log)+1 {
 			rf.mu.Unlock()
-			log.Printf("rf %d as leader received follower %d success persistence message for log %d \n", rf.me, server, args.PrevLogIndex+1)
+			//log.Printf("rf %d as leader received follower %d success persistence message for log %d \n", rf.me, server, args.PrevLogIndex+1)
 			break
 		}
 		// there are still some log left to be sync. re populate the log and continue the loop.
@@ -691,7 +661,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		args.PrevLogTerm = rf.persistedState.Log[args.PrevLogIndex-1].Term
 		//args.Entries = rf.persistedState.Log[curLogIndex-1].copy()
 		args.Entries = copySlice(rf.persistedState.Log[curLogIndex-1:])
-		log.Printf("resume rf %d and send with prevLog %d\n", server, args.PrevLogIndex)
+		//log.Printf("resume rf %d and send with prevLog %d\n", server, args.PrevLogIndex)
 		rf.mu.Unlock()
 	}
 }
@@ -799,7 +769,7 @@ func (rf *Raft) tryCommit(startCommandIndex int) {
 			break
 		}
 		if rf.isPersistedByMajority(startCommandIndex) {
-			log.Printf("rf %d: command with index %d is persisted by majority\n", rf.me, startCommandIndex)
+			//log.Printf("rf %d: command with index %d is persisted by majority\n", rf.me, startCommandIndex)
 			rf.mu.Unlock()
 			break
 		}
@@ -879,7 +849,7 @@ func (rf *Raft) initElection() bool {
 	rf.mu.Lock()
 
 	// 发起选举.
-	log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
+	//log.Printf("rf %d didn't receive heart beat and is initiating an election with term %d\n", rf.me, rf.persistedState.CurrentTerm+1)
 	rf.SetIdentity(IDENTITY_CANDIDATE)
 
 	// 先准备好rpc消息 并且增大current Term
